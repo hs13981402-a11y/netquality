@@ -2,6 +2,7 @@ package com.netquality.app
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -11,8 +12,11 @@ import android.os.Bundle
 import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.ProgressBar
+import android.widget.RadioButton
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -20,100 +24,95 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.HttpURLConnection
 import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.Random
-import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
-
-    // ───────────── تنظیمات قابل ویرایش ─────────────
-    data class Target(val name: String, val host: String, val port: Int)
-    data class Site(val name: String, val url: String, val internal: Boolean)
-
-    companion object {
-        // اهداف پینگ (port برای حالتی است که ICMP مسدود باشد و با TCP تست شود)
-        val TARGETS = listOf(
-            Target("Google DNS", "8.8.8.8", 53),
-            Target("Cloudflare", "1.1.1.1", 53)
-        )
-
-        // سایت‌های تست دسترسی؛ internal = سایت داخلی ایران
-        val SITES = listOf(
-            Site("Google", "https://www.gstatic.com/generate_204", false),
-            Site("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace", false),
-            Site("دیجی‌کالا", "https://www.digikala.com", true),
-            Site("آپارات", "https://www.aparat.com", true)
-        )
-
-        // دامنه‌های تست DNS
-        val DNS_DOMAINS = listOf("google.com", "digikala.com")
-
-        // آدرس‌های تست سرعت دانلود (به ترتیب امتحان می‌شوند)
-        val SPEED_URLS = listOf(
-            "https://speed.cloudflare.com/__down?bytes=25000000",
-            "http://cachefly.cachefly.net/10mb.test",
-            "https://proof.ovh.net/files/10Mb.dat"
-        )
-
-        // تشخیص Captive Portal (صفحه‌ی ورود هات‌اسپات)
-        const val CAPTIVE_URL = "http://connectivitycheck.gstatic.com/generate_204"
-
-        const val PREFS = "netq"
-        const val KEY_HISTORY = "history"
-    }
-
-    // ───────────── مدل‌ها ─────────────
-    data class PingResult(
-        val host: String, val sent: Int, val received: Int,
-        val avg: Double, val min: Double, val max: Double,
-        val jitter: Double, val method: String
-    ) {
-        val loss: Double get() = if (sent == 0) 100.0 else (sent - received) * 100.0 / sent
-    }
-
-    data class HttpRes(val code: Int?, val ms: Long, val err: String?) {
-        val ok: Boolean get() = code != null
-    }
 
     data class NetInfo(
         val connected: Boolean, val type: String, val ssid: String,
         val rssi: Int?, val freq: Int?, val link: Int?, val gateway: String?
     )
 
-    // ───────────── وضعیت UI ─────────────
+    private class HopStat {
+        var ip: String? = null
+        var sent = 0
+        var recv = 0
+        var last = 0.0
+        var sum = 0.0
+        var min = Double.MAX_VALUE
+        var max = 0.0
+        val hist = ArrayList<Double>() // -1 = loss
+
+        fun add(rtt: Double?, ipSeen: String?) {
+            sent++
+            if (ipSeen != null) ip = ipSeen
+            if (rtt == null) {
+                hist.add(-1.0)
+            } else {
+                recv++
+                last = rtt
+                sum += rtt
+                if (rtt < min) min = rtt
+                if (rtt > max) max = rtt
+                hist.add(rtt)
+            }
+            if (hist.size > 300) hist.removeAt(0)
+        }
+
+        val avg: Double get() = if (recv == 0) 0.0 else sum / recv
+        val loss: Double get() = if (sent == 0) 0.0 else (sent - recv) * 100.0 / sent
+    }
+
+    // ───────── Views ─────────
+    private lateinit var panelTest: View
+    private lateinit var panelPlot: View
+    private lateinit var panelSettings: View
+
     private lateinit var tvStatus: TextView
     private lateinit var tvLog: TextView
     private lateinit var btnStart: Button
     private lateinit var btnHistory: Button
     private lateinit var progress: ProgressBar
     private lateinit var cbAuto: CheckBox
+
+    private lateinit var etHost: EditText
+    private lateinit var etPort: EditText
+    private lateinit var rbTcp: RadioButton
+    private lateinit var btnPlot: Button
+    private lateinit var tvPlotInfo: TextView
+    private lateinit var tvTable: TextView
+    private lateinit var graph: GraphView
+
     private lateinit var cm: ConnectivityManager
     private var running = false
+    private var plotJob: Job? = null
+    private var lastPlotReport = ""
     private val log = StringBuilder()
+
+    private val cfgFields = listOf(
+        "ping" to R.id.etPing,
+        "dns_servers" to R.id.etDnsServers,
+        "dns_domains" to R.id.etDnsDomains,
+        "sites_intl" to R.id.etSitesIntl,
+        "sites_local" to R.id.etSitesLocal,
+        "speed" to R.id.etSpeed
+    )
 
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             runOnUiThread {
                 if (cbAuto.isChecked && !running) {
                     lifecycleScope.launch {
-                        delay(2500) // صبر کن اتصال کامل برقرار بشه
+                        delay(2500)
                         if (!running && cbAuto.isChecked) runTest()
                     }
                 }
@@ -128,16 +127,44 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        panelTest = findViewById(R.id.panelTest)
+        panelPlot = findViewById(R.id.panelPlot)
+        panelSettings = findViewById(R.id.panelSettings)
+
         tvStatus = findViewById(R.id.tvStatus)
         tvLog = findViewById(R.id.tvLog)
         btnStart = findViewById(R.id.btnStart)
         btnHistory = findViewById(R.id.btnHistory)
         progress = findViewById(R.id.progress)
         cbAuto = findViewById(R.id.cbAuto)
+
+        etHost = findViewById(R.id.etHost)
+        etPort = findViewById(R.id.etPort)
+        rbTcp = findViewById(R.id.rbTcp)
+        btnPlot = findViewById(R.id.btnPlot)
+        tvPlotInfo = findViewById(R.id.tvPlotInfo)
+        tvTable = findViewById(R.id.tvTable)
+        graph = findViewById(R.id.graph)
+
         cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+        findViewById<Button>(R.id.tabTest).setOnClickListener { showPanel(0) }
+        findViewById<Button>(R.id.tabPlot).setOnClickListener { showPanel(1) }
+        findViewById<Button>(R.id.tabSettings).setOnClickListener { showPanel(2) }
 
         btnStart.setOnClickListener { runTest() }
         btnHistory.setOnClickListener { showHistory() }
+        findViewById<Button>(R.id.btnShareTest).setOnClickListener {
+            share(tvStatus.text.toString() + "\n\n" + tvLog.text.toString())
+        }
+
+        btnPlot.setOnClickListener { togglePlot() }
+        findViewById<Button>(R.id.btnSharePlot).setOnClickListener { share(lastPlotReport) }
+
+        findViewById<Button>(R.id.btnSave).setOnClickListener { saveSettings() }
+        findViewById<Button>(R.id.btnReset).setOnClickListener { resetSettings() }
+        loadSettings()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
@@ -157,7 +184,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ───────────── اجرای تست کامل ─────────────
+    private fun showPanel(i: Int) {
+        panelTest.visibility = if (i == 0) View.VISIBLE else View.GONE
+        panelPlot.visibility = if (i == 1) View.VISIBLE else View.GONE
+        panelSettings.visibility = if (i == 2) View.VISIBLE else View.GONE
+    }
+
+    private fun share(text: String) {
+        if (text.isBlank()) return
+        val i = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        startActivity(Intent.createChooser(i, "ارسال گزارش"))
+    }
+
+    // ───────── تنظیمات ─────────
+    private fun loadSettings() {
+        for ((k, id) in cfgFields) findViewById<EditText>(id).setText(Config.get(this, k))
+    }
+
+    private fun saveSettings() {
+        for ((k, id) in cfgFields) Config.put(this, k, findViewById<EditText>(id).text.toString())
+        Toast.makeText(this, "ذخیره شد", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun resetSettings() {
+        for ((k, _) in cfgFields) Config.reset(this, k)
+        loadSettings()
+        Toast.makeText(this, "به پیش‌فرض برگشت", Toast.LENGTH_SHORT).show()
+    }
+
+    // ════════════════════════════════════════════
+    //                 تست کامل
+    // ════════════════════════════════════════════
     private fun add(section: String) {
         log.append(section).append("\n\n")
         tvLog.text = log.toString()
@@ -172,6 +232,13 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = ""
         tvStatus.text = "⏳ در حال تست… (حدود ۳۰ ثانیه)"
 
+        val targets = Config.lines(this, "ping").map { Config.parseTarget(it) }
+        val dnsServers = Config.lines(this, "dns_servers")
+        val dnsDomains = Config.lines(this, "dns_domains")
+        val sites = Config.lines(this, "sites_intl").map { Site(Config.siteName(it), Config.normUrl(it), false) } +
+                Config.lines(this, "sites_local").map { Site(Config.siteName(it), Config.normUrl(it), true) }
+        val speedUrls = Config.lines(this, "speed").map { Config.normUrl(it) }
+
         lifecycleScope.launch {
             var severity = 0
             val issues = ArrayList<String>()
@@ -179,6 +246,7 @@ class MainActivity : AppCompatActivity() {
                 if (sev > severity) severity = sev
                 issues.add((if (sev >= 2) "❌ " else "⚠️ ") + msg)
             }
+            fun bad(v: Long?) = v == null || v < 0
 
             var info: NetInfo? = null
             var pingText = "-"
@@ -202,113 +270,131 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
                 ni.rssi?.let {
-                    if (it < -80) issue(2, "سیگنال Wi-Fi خیلی ضعیف است ($it dBm). به مودم نزدیک‌تر شوید.")
-                    else if (it < -70) issue(1, "سیگنال Wi-Fi ضعیف است ($it dBm).")
+                    if (it < -80) {
+                        issue(2, "سیگنال Wi-Fi خیلی ضعیف است ($it dBm). به مودم نزدیک‌تر شوید.")
+                    } else if (it < -70) {
+                        issue(1, "سیگنال Wi-Fi ضعیف است ($it dBm).")
+                    }
                 }
 
-                // ۲) پینگ / Jitter / Packet Loss (موازی)
+                // ۲) پینگ / Jitter / Packet Loss
                 val gwDef = ni.gateway?.let { gw -> async { ping(gw, 80, 8) } }
-                val tDefs = TARGETS.map { t -> async { ping(t.host, t.port, 8) } }
+                val tDefs = targets.map { t -> async { ping(t.host, t.port, 8) } }
                 val gwRes = gwDef?.await()
                 val inet = tDefs.map { it.await() }
 
                 val ps = StringBuilder("🏓 پینگ، Jitter و Packet Loss")
                 gwRes?.let { ps.append("\n").append(fmtPing("روتر (Gateway)", it)) }
-                TARGETS.forEachIndexed { i, t -> ps.append("\n").append(fmtPing(t.name, inet[i])) }
+                targets.forEachIndexed { i, t -> ps.append("\n").append(fmtPing(t.host, inet[i])) }
                 add(ps.toString())
 
                 val inetOk = inet.any { it.received > 0 }
                 if (gwRes != null) {
-                    if (gwRes.received == 0 && !inetOk) {
+                    if (gwRes.received == 0 && !inetOk && targets.isNotEmpty()) {
                         issue(2, "نه روتر جواب می‌دهد نه اینترنت؛ مشکل از Wi-Fi یا خود روتر است.")
-                    } else if (gwRes.received > 0 && !inetOk) {
+                    } else if (gwRes.received > 0 && !inetOk && targets.isNotEmpty()) {
                         issue(2, "روتر در دسترس است ولی اینترنت نیست؛ مشکل از لینک اینترنت (WAN/ISP) است.")
                     } else if (gwRes.received > 0 && (gwRes.avg > 20 || gwRes.loss >= 5)) {
                         issue(1, "تاخیر/افت بین گوشی و روتر بالاست (${f0(gwRes.avg)}ms)؛ مشکل از Wi-Fi داخلی (سیگنال یا تداخل) است.")
                     }
-                } else if (!inetOk) {
+                } else if (!inetOk && targets.isNotEmpty()) {
                     issue(2, "هیچ‌کدام از هدف‌ها پینگ نشدند؛ اینترنت قطع است یا مسدود شده.")
                 }
-                TARGETS.forEachIndexed { i, t ->
+                targets.forEachIndexed { i, t ->
                     val r = inet[i]
                     if (r.received > 0) {
-                        if (r.loss >= 5) issue(1, "افت بسته (Packet Loss) به ${t.name}: ${f0(r.loss)}٪")
-                        if (r.avg > 150) issue(1, "تاخیر بالا به ${t.name}: ${f0(r.avg)}ms")
-                        if (r.jitter > 30) issue(1, "نوسان تاخیر (Jitter) بالا به ${t.name}: ${f0(r.jitter)}ms")
+                        if (r.loss >= 5) issue(1, "افت بسته (Packet Loss) به ${t.host}: ${f0(r.loss)}٪")
+                        if (r.avg > 150) issue(1, "تاخیر بالا به ${t.host}: ${f0(r.avg)}ms")
+                        if (r.jitter > 30) issue(1, "نوسان تاخیر (Jitter) بالا به ${t.host}: ${f0(r.jitter)}ms")
                     }
                 }
                 val okRes = inet.filter { it.received > 0 }
                 if (okRes.isNotEmpty()) pingText = f0(okRes.map { it.avg }.average()) + "ms"
-                lossText = f0(inet.map { it.loss }.average()) + "%"
+                if (inet.isNotEmpty()) lossText = f0(inet.map { it.loss }.average()) + "%"
 
                 // ۳) تست DNS
-                val rows = DNS_DOMAINS.map { d -> async { dnsRow(d) } }.map { it.await() }
-                val ds = StringBuilder("🔎 تست DNS (سیستم / 8.8.8.8 / 1.1.1.1)")
-                DNS_DOMAINS.forEachIndexed { i, d ->
-                    val (s, g, c) = rows[i]
-                    ds.append("\n$d: ${fmtDns(s)} / ${fmtDns(g)} / ${fmtDns(c)}")
-                }
-                add(ds.toString())
-                fun bad(v: Long?) = v == null || v < 0
-                val (s0, g0, c0) = rows[0]
-                if (bad(s0) && (!bad(g0) || !bad(c0))) {
-                    issue(2, "DNS پیش‌فرض این شبکه جواب نمی‌دهد ولی DNS گوگل/کلودفلر کار می‌کند؛ DNS ارائه‌دهنده مشکل دارد (می‌توانید DNS را روی 8.8.8.8 یا 1.1.1.1 بگذارید).")
-                } else if (bad(s0) && bad(g0) && bad(c0)) {
-                    if (inetOk) issue(2, "هیچ DNS ای جواب نمی‌دهد؛ احتمالاً پورت 53 مسدود است.")
-                } else if (s0 != null && s0 > 300) {
-                    issue(1, "پاسخ DNS کند است (${s0}ms).")
+                if (dnsDomains.isNotEmpty()) {
+                    val rows = dnsDomains.map { d -> async { dnsRow(d, dnsServers) } }.map { it.await() }
+                    val ds = StringBuilder("🔎 تست DNS")
+                    dnsDomains.forEachIndexed { i, d ->
+                        val (s, r) = rows[i]
+                        ds.append("\n$d → سیستم ${fmtDns(s)}")
+                        dnsServers.forEachIndexed { j, sv -> ds.append(" | $sv ${fmtDns(r[j])}") }
+                    }
+                    add(ds.toString())
+
+                    val (s0, r0) = rows[0]
+                    val anySrvOk = r0.any { !bad(it) }
+                    if (bad(s0) && anySrvOk) {
+                        issue(2, "DNS پیش‌فرض این شبکه جواب نمی‌دهد ولی DNS عمومی کار می‌کند؛ DNS ارائه‌دهنده مشکل دارد (می‌توانید DNS را روی 8.8.8.8 یا 1.1.1.1 بگذارید).")
+                    } else if (bad(s0) && r0.isNotEmpty() && !anySrvOk) {
+                        if (inetOk) issue(2, "هیچ DNS ای جواب نمی‌دهد؛ احتمالاً پورت 53 مسدود است.")
+                    } else if (s0 != null && s0 > 300) {
+                        issue(1, "پاسخ DNS کند است (${s0}ms).")
+                    }
+                    dnsServers.forEachIndexed { j, sv ->
+                        if (bad(r0[j]) && (!bad(s0) || anySrvOk)) issue(1, "DNS سرور $sv جواب نمی‌دهد.")
+                    }
                 }
 
                 // ۴) دسترسی سایت‌ها + Captive Portal
-                val capDef = async(Dispatchers.IO) { httpCheck(CAPTIVE_URL, false) }
-                val siteDefs = SITES.map { s -> async(Dispatchers.IO) { httpCheck(s.url, true) } }
+                val capDef = async(Dispatchers.IO) { Net.httpCheck("http://connectivitycheck.gstatic.com/generate_204", false) }
+                val siteDefs = sites.map { s -> async(Dispatchers.IO) { Net.httpCheck(s.url, true) } }
                 val cap = capDef.await()
                 val siteRes = siteDefs.map { it.await() }
 
-                val hs = StringBuilder("🌐 دسترسی سایت‌ها")
-                SITES.forEachIndexed { i, s ->
-                    val r = siteRes[i]
-                    val kind = if (s.internal) "داخلی" else "بین‌المللی"
-                    hs.append("\n${s.name} ($kind): ")
-                    if (r.ok) hs.append("✅ ${r.code} (${r.ms}ms)") else hs.append("❌ ${r.err ?: "خطا"}")
+                if (sites.isNotEmpty()) {
+                    val hs = StringBuilder("🌐 دسترسی سایت‌ها")
+                    sites.forEachIndexed { i, s ->
+                        val r = siteRes[i]
+                        val kind = if (s.internal) "داخلی" else "بین‌المللی"
+                        hs.append("\n${s.name} ($kind): ")
+                        if (r.ok) hs.append("✅ ${r.code} (${r.ms}ms)") else hs.append("❌ ${r.err ?: "خطا"}")
+                    }
+                    add(hs.toString())
                 }
-                add(hs.toString())
 
                 val cc = cap.code
                 val captivePortal = cc != null && cc != 204 && cc in 200..399
                 if (captivePortal) {
                     issue(2, "این شبکه صفحه‌ی ورود (Captive Portal / هات‌اسپات) دارد و تا لاگین نکنید اینترنت نمی‌دهد.")
                 } else {
-                    val intlIdx = SITES.indices.filter { !SITES[it].internal }
-                    val locIdx = SITES.indices.filter { SITES[it].internal }
+                    val intlIdx = sites.indices.filter { !sites[it].internal }
+                    val locIdx = sites.indices.filter { sites[it].internal }
                     val intlOk = intlIdx.count { siteRes[it].ok }
                     val locOk = locIdx.count { siteRes[it].ok }
-                    if (intlOk == 0 && locOk > 0) {
-                        issue(2, "اینترنت بین‌المللی قطع یا فیلتر است؛ فقط سایت‌های داخلی باز می‌شوند.")
-                    } else if (intlOk > 0 && locOk == 0) {
-                        issue(1, "سایت‌های داخلی باز نمی‌شوند (مشکل DNS داخلی یا مسدودی).")
-                    } else if (intlOk == 0 && locOk == 0 && inetOk) {
+                    if (intlIdx.isNotEmpty() && locIdx.isNotEmpty()) {
+                        if (intlOk == 0 && locOk > 0) {
+                            issue(2, "اینترنت بین‌المللی قطع یا فیلتر است؛ فقط سایت‌های داخلی باز می‌شوند.")
+                        } else if (intlOk > 0 && locOk == 0) {
+                            issue(1, "سایت‌های داخلی باز نمی‌شوند (مشکل DNS داخلی یا مسدودی).")
+                        }
+                    }
+                    if (sites.isNotEmpty() && intlOk == 0 && locOk == 0 && inetOk) {
                         issue(2, "پینگ هست ولی هیچ سایتی باز نمی‌شود؛ احتمال مشکل DNS، فیلتر یا پورتال.")
                     }
                     siteRes.forEachIndexed { i, r ->
-                        if (r.ok && r.ms > 3000) issue(1, "بازشدن ${SITES[i].name} کند است (${r.ms}ms).")
+                        if (r.ok && r.ms > 3000) issue(1, "بازشدن ${sites[i].name} کند است (${r.ms}ms).")
                     }
                 }
 
                 // ۵) سرعت دانلود
                 val reachable = inetOk || siteRes.any { it.ok }
-                if (reachable && !captivePortal) {
+                if (reachable && !captivePortal && speedUrls.isNotEmpty()) {
                     tvStatus.text = "⏳ در حال تست سرعت دانلود…"
                     var mbps: Double? = null
-                    for (u in SPEED_URLS) {
-                        mbps = withContext(Dispatchers.IO) { speedTest(u) }
+                    for (u in speedUrls) {
+                        mbps = withContext(Dispatchers.IO) { Net.speedTest(u) }
                         if (mbps != null) break
                     }
                     if (mbps != null) {
                         speedText = f1(mbps) + " Mbps"
                         add("⬇️ سرعت دانلود: $speedText")
-                        if (mbps < 1.0) issue(2, "سرعت دانلود بسیار پایین است (${f1(mbps)} Mbps).")
-                        else if (mbps < 5.0) issue(1, "سرعت دانلود پایین است (${f1(mbps)} Mbps).")
+                        if (mbps < 1.0) {
+                            issue(2, "سرعت دانلود بسیار پایین است (${f1(mbps)} Mbps).")
+                        } else if (mbps < 5.0) {
+                            issue(1, "سرعت دانلود پایین است (${f1(mbps)} Mbps).")
+                        }
                     } else {
                         speedText = "ناموفق"
                         add("⬇️ سرعت دانلود: تست انجام نشد (سرور تست در دسترس نیست)")
@@ -336,7 +422,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ───────────── اطلاعات شبکه ─────────────
     @Suppress("DEPRECATION")
     private fun readNetInfo(): NetInfo {
         val none = NetInfo(false, "بدون اتصال", "", null, null, null, null)
@@ -385,12 +470,11 @@ class MainActivity : AppCompatActivity() {
         else -> 0
     }
 
-    // ───────────── پینگ ─────────────
-    private suspend fun ping(host: String, tcpPort: Int, count: Int): PingResult =
+    private suspend fun ping(host: String, tcpPort: Int, count: Int): Net.PingResult =
         withContext(Dispatchers.IO) {
-            val icmp = icmpPing(host, count)
+            val icmp = Net.icmpPing(host, count)
             if (icmp != null && icmp.received > 0) return@withContext icmp
-            val tcp = tcpPing(host, tcpPort, count)
+            val tcp = Net.tcpPing(host, tcpPort, count)
             if (tcp.received > 0) {
                 tcp.copy(method = if (icmp != null) "TCP، ICMP مسدود است" else "TCP")
             } else {
@@ -398,108 +482,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    private fun icmpPing(host: String, count: Int): PingResult? {
-        return try {
-            val p = ProcessBuilder(
-                "/system/bin/ping", "-c", "$count", "-W", "2", "-w", "${count + 6}", host
-            ).redirectErrorStream(true).start()
-            val times = ArrayList<Double>()
-            val re = Regex("time=([0-9.]+)")
-            p.inputStream.bufferedReader().useLines { lines ->
-                lines.forEach { l -> re.find(l)?.let { times.add(it.groupValues[1].toDouble()) } }
-            }
-            p.waitFor()
-            stats(host, count, times, "ICMP")
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun tcpPing(host: String, port: Int, count: Int): PingResult {
-        val times = ArrayList<Double>()
-        repeat(count) {
-            try {
-                Socket().use { s ->
-                    val t0 = System.nanoTime()
-                    s.connect(InetSocketAddress(host, port), 2000)
-                    times.add((System.nanoTime() - t0) / 1e6)
-                }
-            } catch (_: Exception) {
-            }
-            Thread.sleep(200)
-        }
-        return stats(host, count, times, "TCP")
-    }
-
-    private fun stats(host: String, sent: Int, t: List<Double>, method: String): PingResult {
-        if (t.isEmpty()) return PingResult(host, sent, 0, 0.0, 0.0, 0.0, 0.0, method)
-        var j = 0.0
-        for (i in 1 until t.size) j += abs(t[i] - t[i - 1])
-        j = if (t.size > 1) j / (t.size - 1) else 0.0
-        return PingResult(host, sent, t.size, t.average(), t.min(), t.max(), j, method)
-    }
-
-    private fun fmtPing(name: String, r: PingResult): String =
+    private fun fmtPing(name: String, r: Net.PingResult): String =
         if (r.received == 0) "$name: ❌ بدون پاسخ"
         else "$name: ${f0(r.avg)}ms | jitter ${f0(r.jitter)} | loss ${f0(r.loss)}% (${r.method})"
 
-    // ───────────── DNS ─────────────
-    private suspend fun dnsRow(d: String): Triple<Long?, Long?, Long?> = coroutineScope {
-        val s = async { sysResolve(d) }
-        val g = async(Dispatchers.IO) { dnsQuery("8.8.8.8", d) }
-        val c = async(Dispatchers.IO) { dnsQuery("1.1.1.1", d) }
-        Triple(s.await(), g.await(), c.await())
-    }
-
-    // null = timeout ، -1 = پاسخ نامعتبر ، غیر از اون‌ها = میلی‌ثانیه
-    private suspend fun sysResolve(domain: String): Long? {
-        val d = lifecycleScope.async(Dispatchers.IO) {
-            try {
-                val t0 = System.nanoTime()
-                InetAddress.getByName(domain)
-                (System.nanoTime() - t0) / 1_000_000
-            } catch (e: Exception) {
-                -1L
-            }
+    private suspend fun dnsRow(d: String, servers: List<String>): Pair<Long?, List<Long?>> =
+        coroutineScope {
+            val s = async(Dispatchers.IO) { Net.sysResolve(d, 4000) }
+            val r = servers.map { sv -> async(Dispatchers.IO) { Net.dnsQuery(sv, d) } }
+            Pair(s.await(), r.map { it.await() })
         }
-        return withTimeoutOrNull(4000) { d.await() }
-    }
-
-    private fun dnsQuery(server: String, domain: String): Long? {
-        return try {
-            val id = Random().nextInt(0xFFFF)
-            val baos = ByteArrayOutputStream()
-            val dos = DataOutputStream(baos)
-            dos.writeShort(id)
-            dos.writeShort(0x0100) // recursion desired
-            dos.writeShort(1)
-            dos.writeShort(0)
-            dos.writeShort(0)
-            dos.writeShort(0)
-            for (part in domain.split(".")) {
-                dos.writeByte(part.length)
-                dos.writeBytes(part)
-            }
-            dos.writeByte(0)
-            dos.writeShort(1) // type A
-            dos.writeShort(1) // class IN
-            val data = baos.toByteArray()
-            DatagramSocket().use { s ->
-                s.soTimeout = 2500
-                val t0 = System.nanoTime()
-                s.send(DatagramPacket(data, data.size, InetAddress.getByName(server), 53))
-                val buf = ByteArray(512)
-                s.receive(DatagramPacket(buf, buf.size))
-                val ms = (System.nanoTime() - t0) / 1_000_000
-                val rid = ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
-                val rcode = buf[3].toInt() and 0x0F
-                val an = ((buf[6].toInt() and 0xFF) shl 8) or (buf[7].toInt() and 0xFF)
-                if (rid == id && rcode == 0 && an > 0) ms else -1L
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
 
     private fun fmtDns(v: Long?): String = when {
         v == null -> "timeout"
@@ -507,65 +499,140 @@ class MainActivity : AppCompatActivity() {
         else -> "${v}ms"
     }
 
-    // ───────────── HTTP و سرعت ─────────────
-    private fun httpCheck(url: String, follow: Boolean): HttpRes {
-        val t0 = System.nanoTime()
-        return try {
-            val c = URL(url).openConnection() as HttpURLConnection
-            c.connectTimeout = 5000
-            c.readTimeout = 5000
-            c.instanceFollowRedirects = follow
-            c.requestMethod = "GET"
-            c.setRequestProperty("User-Agent", "Mozilla/5.0")
-            val code = c.responseCode
-            c.disconnect()
-            HttpRes(code, (System.nanoTime() - t0) / 1_000_000, null)
-        } catch (e: Exception) {
-            HttpRes(null, (System.nanoTime() - t0) / 1_000_000, e.javaClass.simpleName)
-        }
-    }
-
-    private fun speedTest(url: String, maxMs: Long = 8000): Double? {
-        return try {
-            val c = URL(url).openConnection() as HttpURLConnection
-            c.connectTimeout = 5000
-            c.readTimeout = 5000
-            c.setRequestProperty("User-Agent", "Mozilla/5.0")
-            c.inputStream.use { ins ->
-                val buf = ByteArray(32 * 1024)
-                var total = 0L
-                val t0 = System.nanoTime()
-                while (true) {
-                    val n = ins.read(buf)
-                    if (n < 0) break
-                    total += n
-                    if ((System.nanoTime() - t0) / 1_000_000 > maxMs) break
-                }
-                val sec = (System.nanoTime() - t0) / 1e9
-                if (total < 100_000 || sec <= 0) null else total * 8 / sec / 1e6
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    // ───────────── تاریخچه ─────────────
+    // ───────── تاریخچه ─────────
     private fun saveHistory(line: String) {
-        val sp = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val old = sp.getString(KEY_HISTORY, "") ?: ""
+        val sp = getSharedPreferences("netq", MODE_PRIVATE)
+        val old = sp.getString("history", "") ?: ""
         val lines = (listOf(line) + old.split("\n").filter { it.isNotBlank() }).take(40)
-        sp.edit().putString(KEY_HISTORY, lines.joinToString("\n")).apply()
+        sp.edit().putString("history", lines.joinToString("\n")).apply()
     }
 
     private fun showHistory() {
-        val sp = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val text = sp.getString(KEY_HISTORY, "")?.takeIf { it.isNotBlank() } ?: "هنوز تستی انجام نشده."
+        val sp = getSharedPreferences("netq", MODE_PRIVATE)
+        val text = sp.getString("history", "")?.takeIf { it.isNotBlank() } ?: "هنوز تستی انجام نشده."
         AlertDialog.Builder(this)
             .setTitle("تاریخچه‌ی تست‌ها")
             .setMessage(text)
             .setPositiveButton("بستن", null)
-            .setNeutralButton("پاک کردن") { _, _ -> sp.edit().remove(KEY_HISTORY).apply() }
+            .setNeutralButton("پاک کردن") { _, _ -> sp.edit().remove("history").apply() }
             .show()
+    }
+
+    // ════════════════════════════════════════════
+    //            تریس / پلاتر (مثل PingPlotter)
+    // ════════════════════════════════════════════
+    private fun togglePlot() {
+        if (plotJob?.isActive == true) {
+            plotJob?.cancel()
+            return
+        }
+        val host = etHost.text.toString().trim()
+        if (host.isEmpty()) return
+        val tcp = rbTcp.isChecked
+        val port = etPort.text.toString().trim().toIntOrNull() ?: 443
+        btnPlot.text = "توقف"
+        plotJob = lifecycleScope.launch {
+            try {
+                if (tcp) runTcpPlot(host, port) else runIcmpPlot(host)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                tvPlotInfo.text = "خطا: ${e.message}"
+            } finally {
+                btnPlot.text = "شروع"
+            }
+        }
+    }
+
+    private suspend fun runIcmpPlot(host: String) {
+        tvPlotInfo.text = "⏳ در حال پیدا کردن مسیر…"
+        tvTable.text = ""
+        graph.data = emptyList()
+
+        val ip = withContext(Dispatchers.IO) {
+            try {
+                InetAddress.getByName(host).hostAddress
+            } catch (e: Exception) {
+                null
+            }
+        }
+        if (ip == null) {
+            tvPlotInfo.text = "❌ آدرس پیدا نشد (DNS جواب نداد)."
+            return
+        }
+        val base = withContext(Dispatchers.IO) { Net.baseline() }
+
+        // کشف مسیر: همه‌ی TTL ها هم‌زمان
+        val maxTtl = 30
+        val probes = coroutineScope {
+            (1..maxTtl).map { t -> async(Dispatchers.IO) { Net.probeTtl(ip, t, base) } }
+                .map { it.await() }
+        }
+        val destIdx = probes.indexOfFirst { it.reached }
+        val lastReply = probes.indexOfLast { it.ip != null } + 1
+        if (destIdx < 0 && lastReply == 0) {
+            tvPlotInfo.text = "❌ هیچ پاسخی نیامد. یا ICMP روی این شبکه بسته است یا گوشی از ping با TTL پشتیبانی نمی‌کند. حالت TCP Ping را امتحان کنید."
+            return
+        }
+        val hops = if (destIdx >= 0) destIdx + 1 else lastReply
+        val stats = List(hops) { HopStat() }
+        for (i in 0 until hops) stats[i].add(probes[i].rtt, probes[i].ip)
+
+        val note = if (destIdx >= 0) "" else "\n⚠️ مقصد به ICMP جواب نمی‌دهد؛ مسیر تا آخرین هاپ پاسخ‌دهنده نشان داده شده."
+        while (true) {
+            render(stats, "مقصد: $host ($ip) | هاپ: $hops$note")
+            val t0 = System.currentTimeMillis()
+            val res = coroutineScope {
+                (1..hops).map { t -> async(Dispatchers.IO) { Net.probeTtl(ip, t, base) } }
+                    .map { it.await() }
+            }
+            res.forEachIndexed { i, p -> stats[i].add(p.rtt, p.ip) }
+            val el = System.currentTimeMillis() - t0
+            delay(maxOf(0L, 1000L - el))
+        }
+    }
+
+    private suspend fun runTcpPlot(host: String, port: Int) {
+        tvTable.text = ""
+        graph.data = emptyList()
+        val s = HopStat()
+        s.ip = "$host:$port"
+        while (true) {
+            val rtt = withContext(Dispatchers.IO) { Net.tcpOnce(host, port, 2000) }
+            s.add(rtt, null)
+            render(listOf(s), "TCP Ping به $host پورت $port")
+            delay(1000)
+        }
+    }
+
+    private fun render(stats: List<HopStat>, header: String) {
+        val sb = StringBuilder()
+        sb.append(String.format(Locale.US, "%-3s %-18s %5s %5s %5s %5s %5s  %s\n",
+            "#", "IP", "Loss", "Last", "Avg", "Min", "Max", "Graph"))
+        stats.forEachIndexed { i, s ->
+            val ip = (s.ip ?: "*").take(18)
+            val last = if (s.recv == 0) "-" else f0(s.last)
+            val avg = if (s.recv == 0) "-" else f0(s.avg)
+            val mn = if (s.recv == 0) "-" else f0(s.min)
+            val mx = if (s.recv == 0) "-" else f0(s.max)
+            sb.append(String.format(Locale.US, "%-3d %-18s %4.0f%% %5s %5s %5s %5s  %s\n",
+                i + 1, ip, s.loss, last, avg, mn, mx, spark(s.hist)))
+        }
+        val table = sb.toString()
+        val sent = stats.lastOrNull()?.sent ?: 0
+        tvTable.text = table
+        tvPlotInfo.text = "$header | نمونه: $sent | زمان‌ها میلی‌ثانیه (برای هاپ‌های میانی تقریبی)"
+        graph.data = stats.last().hist.toList()
+        lastPlotReport = header + "\n" + table
+    }
+
+    private fun spark(h: List<Double>): String {
+        val last = h.takeLast(14)
+        val mx = (last.maxOrNull() ?: 1.0).coerceAtLeast(1.0)
+        val chars = "▁▂▃▄▅▆▇█"
+        return last.joinToString("") { v ->
+            if (v < 0) "×" else chars[minOf(7, (v / mx * 7.999).toInt())].toString()
+        }
     }
 
     private fun f0(d: Double) = String.format(Locale.US, "%.0f", d)
